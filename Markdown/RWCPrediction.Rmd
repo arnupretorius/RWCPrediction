@@ -1,0 +1,447 @@
+---
+title: "Predicting the future of the 2015 Rugby world cup using Domino and R."
+author: "Arnu Pretorius"
+date: "08 September 2015"
+output: html_document
+---
+
+# Introduction
+
+The Rugby World Cup (RWC) is almost here! Fans around the world are getting excited for the action to start on 18 September 2015, with high hopes of their favourite team taking home the trophy. If you have never heard of the sport, [whatisrugby.com][1] provides the following short description:
+
+> Rugby is a free-flowing game that features a combination of strength, speed and strategy to move a ball into an opponents territory. Rugby is a full-contact sport yet players wear little-or no protective gear. Rugby evolved from football (i.e. soccer) and is often called the 'game played in heaven'.
+
+Rugby is a highly entertaining sport to watch, however whether it is truly the game played in heaven, I would guess is still up for debate. 
+
+In this blog post I go through the steps I took to build a machine learning model to predict the outcome of each RWC match using [Domino][2] and [R][3]. Don't feel like reading it all? Feel free to skip to what strikes your fancy:
+
+* Part 1: [Getting the data][]
+* Part 2: [Model Selection][]
+* Part 3: [Automating the process using Domino][]
+* Part 4: [Using Domino API Endpoints for prediction requests][]
+
+Before I go through the specifics, I would just like to mention that the initial idea was to simply get some relevant rugby data from the web, train a specific model using the data collected and then make a prediction. Pretty simple, now lets get started! 
+
+## Getting the data
+
+As with many machine learning undertakings the first step was to collect the data. I found a good source of rugby data at [rugbydata.com][4]. For each of the 20 teams in the RWC I collected some general historical team statistics and past matches stretching back to the beginning of 2013 (shown below for South Africa). 
+
+![alt text](figures/rugbyData.png)
+
+Only the matches between teams that are actually going to compete in the tournament where kept. In addition, tied matches were disgarded. The first reason for this is due to the fact that in rugby a tied match is a fairly rare accorance. The second, is that I was more concerned with predicting a win or a loss, the outcomes most fans care about. As another data source I collected the rankings of each team as well as their recent change in rank from [this site][5] (shown below).
+
+![alt text](figures/ranking.png)
+
+Finally, connected to team rankings are ranking points that I managed to find on a [world rugby rankings][6] Wikipedia page. 
+
+![alt text](figures/wiki.png)
+
+Since most of the data only reflect the current state of each team's historical performance and rank, weights were computing based on the date of each match (matches are treated as observations) in an attempt to adjust the data to reflect a more accurate state of a team for past matches. The entire data collection, cleaning and weighting was done using R and the code is given below.
+
+```{r getData, eval=FALSE}
+#### Construct WRC data set ####
+
+# The Teams
+teams <- c("Namibia", "South Africa", "Argentina", "Canada", "United States",
+           "Uruguay", "Japan", "England", "France", "Georgia", "Ireland",
+           "Italy", "Romania", "Scotland", "Wales", "Australia",
+           "Fiji", "New Zealand", "Samoa", "Tonga")
+
+# Get rank data
+library(XML)
+library(RCurl)
+Nteams <- length(teams)
+rank <- numeric(Nteams)
+rankScore <- numeric(Nteams)
+rankChange <- numeric(Nteams)
+
+urlRankScore <- "https://en.wikipedia.org/wiki/World_Rugby_Rankings"
+tabs1 <- getURL(urlRankScore)
+tabs1 <- readHTMLTable(tabs1, stringsAsFactors = F)
+
+urlRank <- "http://wrr.live555.com/"
+tabs2 <- getURL(urlRank)
+tabs2 <- readHTMLTable(tabs2, stringsAsFactors = F)
+for(i in 1:length(tabs2[[2]][,2])){
+    index <- which(teams == tabs2[[2]][i,2])
+    if(length(index) != 0){
+        rank[index] <- as.numeric(tabs2[[2]][i,1])
+        if(tabs2[[2]][i,4] == ""){
+            rankChange[index] <- 0
+        } else {
+            rankChange[index] <- as.numeric(tabs2[[2]][i,4])
+        }
+    }
+}
+
+for(i in 1:length(tabs1[[1]][,4])){
+    index <- which(teams == tabs1[[1]][i,3])
+    if(length(index) != 0){
+        rankScore[index] <- as.numeric(tabs1[[1]][i,4])
+    }
+}
+
+saveRDS(rank, "rank.rda")
+saveRDS(rankScore, "rankScore.rda")
+saveRDS(rankChange, "rankChange.rda")
+
+teamLoop <- tolower(gsub(" ", "", teams, fixed = TRUE))
+
+# Get match data
+matchDate <- NULL
+homeTeam <- NULL
+scores <- NULL
+awayTeam <- NULL
+
+otherVarList <- list()
+
+for(i in 1:Nteams){
+    fileUrl <- paste("http://www.rugbydata.com/", teamLoop[i], "/gamesplayed/", sep="")
+    doc <- htmlTreeParse(fileUrl, useInternal=TRUE)
+    matchDate <- c(matchDate, xpathSApply(doc, "//td[@class='match-date']", xmlValue)) 
+    homeTeam <- c(homeTeam, xpathSApply(doc, "//td[@class='home-team']", xmlValue)) 
+    scores <- c(scores, xpathSApply(doc, "//a[@class='match-score']", xmlValue)) 
+    awayTeam <- c(awayTeam, xpathSApply(doc, "//td[@class='away-team']", xmlValue)) 
+    otherVarList[[i]] <- as.numeric(xpathSApply(doc, "//span[@class='rdnumeric']", xmlValue))
+}  
+
+saveRDS(otherVarList, file = "teamStats.rda")
+
+# Create date vector and compute linear weights
+dates <- as.Date(matchDate, format="%d %B %Y")
+numDates <- as.numeric(dates[order(dates)])
+weights <- (numDates-min(numDates))/(max(numDates)-min(numDates))
+
+# Extract scores
+tempScores <- strsplit(scores, "-")
+
+outcome <- NULL
+ties <- NULL
+countTies <- 1
+
+# Populate win and loss labels for each matche while indexing tied matches
+for(i in 1:length(tempScores)){
+   diff <- as.numeric(tempScores[[i]][1]) - as.numeric(tempScores[[i]][2])
+    if(diff > 0){
+        outcome[i] <- "win"
+    } else if (diff < 0){
+        outcome[i] <- "loose"
+    } else {
+        ties[countTies] <- i
+        countTies <- countTies + 1
+    }
+}
+
+# Remove tied matches and matches not containing world cup teams
+interData <- data.frame(outcome=(factor(outcome)), homeTeam, awayTeam, dates)
+interData <- interData[-ties,]
+countries <- c(homeTeam, awayTeam)
+remove <- NULL
+count <- 1
+for(i in 1:nrow(interData)){
+    if(!is.element(interData[i,2], teams)){
+        remove[count] <- i
+        count <- count+1
+    } else if(!is.element(interData[i,3], teams)){
+        remove[count] <- i
+        count <- count+1
+    }
+}
+interData <- interData[-remove,]
+interData[,2] <- factor(interData[,2])
+interData[,3] <- factor(interData[,3]) 
+interData <- interData[order(interData$dates),]
+interData <- interData[!duplicated(interData),]
+
+# remove corresponding weights
+weights <- weights[-ties]
+weights <- weights[-remove]
+weights <- weights[!duplicated(interData)]
+
+# Add game date variables
+library(lubridate)
+month <- month(interData$dates)
+year <- year(interData$dates)
+interData <- interData[,-4]
+interData$month <- month
+interData$year <- year
+
+# Only select matches as far back as the previous world cup
+weights <- weights[interData$year > 2012]
+interData <- interData[interData$year > 2012,]
+
+
+# Add remaining variables
+homeMat <- matrix(0, nrow=nrow(interData), ncol=24)
+awayMat <- matrix(0, nrow=nrow(interData), ncol=24)
+
+for(i in 1:nrow(interData)){
+    homeIndex <- which(teams == interData[i,2])
+    awayIndex <- which(teams == interData[i,3])
+    homeMat[i,] <- weights[i]*c(otherVarList[[homeIndex]], rank[homeIndex], rankScore[homeIndex], rankChange[homeIndex])
+    awayMat[i,] <- weights[i]*c(otherVarList[[awayIndex]], rank[awayIndex], rankScore[awayIndex], rankChange[awayIndex])
+}
+
+# Export data as csv file
+extraData <- data.frame(cbind(homeMat, awayMat))
+data <- data.frame(interData, extraData)
+
+dataColNames <- c("Outcome", "HomeTeam", "AwayTeam",
+                  "month", "year",
+              "GamesPlayedHome", "GamesWonHome", "GamesLostHome",
+              "GamesDrawnHome", "LongestWinningStreakHome",
+              "LongestLosingStreak Home",
+              "TeamsPlayedHome", "TeamsBeatenHome", 
+              "TeamsBeatenByHome",
+              "TeamsDrawnWithHome", "GroundsPlayedAtHome", 
+              "LargestPointsForHome",
+              "LargestPointsAgainstHome", 
+              "LargestWinningMarginHome", 
+              "LargestLosingMarginHome", "TotalPointsForHome", 
+              "AvgPointsForHome",
+              "TotalPointsAgainstHome", "AvgPointsAgainstHome", 
+              "TotalPointsDifferenceHome", "AvgPointsDifferenceHome",
+              "RankHome", "RankScoreHome", "RankChangeHome",
+              "GamesPlayedAway", "GamesWon Away", "GamesLostAway",
+              "GamesDrawnAway", "LongestWinning StreakAway",
+              "LongestLosingStreakAway",
+              "TeamsPlayedAway", "TeamsBeatenAway", 
+              "TeamsBeatenByAway",
+              "TeamsDrawnWithAway", "GroundsPlayedAtAway", 
+              "LargestPointsForAway",
+              "LargestPointsAgainstAway", 
+              "LargestWinningMarginAway", 
+              "LargestLosingMarginAway", "TotalPointsForAway", 
+              "AvgPointsForAway",
+              "TotalPointsAgainstAway", "AvgPointsAgainstAway", 
+              "TotalPointsDifferenceAway", "AvgPointsDifferenceAway",
+              "RankAway", "RankScoreAway", "RankChangeAway")
+
+colnames(data) <- dataColNames
+write.table(data[1,], "newCase.csv", sep=",")
+write.table(data, "RWCData.csv", sep=",")
+```
+
+## Model Selection
+
+```{r DataLoadAndSplit, cache=TRUE, message=FALSE, warning=FALSE}
+library(caret)
+library(randomForest)
+library(ggplot2)
+library(reshape2)
+
+# load data
+data <- read.csv("RWCData.csv")
+
+# split data
+set.seed(123)
+trainIndex <- createDataPartition(data[,1], p = .7,
+                                  list = FALSE,
+                                  times = 1)
+train <- data[trainIndex,]
+test  <- data[-trainIndex,]
+```
+
+```{r CorrelationHeatMap, cache=TRUE, message=FALSE, warning=FALSE}
+# Correlation heat map of the training data
+trainCor <- cbind(as.numeric(train[,1]), as.numeric(train[,2]), as.numeric(train[,3]), train[,-c(1,2,3)])
+
+colnames(trainCor) <- colnames(data)
+title <- "Rugby training data correlation heat map"
+corp <- qplot(x=Var1, y=Var2, data=melt(cor(trainCor, use="p")), fill=value, geom="tile") +
+      scale_fill_gradient2(limits=c(-1, 1))
+corp <- corp + theme(axis.title.x=element_blank(), axis.text.x=element_blank()
+                     , axis.ticks=element_blank())
+corp <- corp + ggtitle(title)
+corp
+```
+
+```{r TuningControl, cache=TRUE, message=FALSE, warning=FALSE}
+# Train classifiers
+library(doParallel)
+cl <- makeCluster(8)
+registerDoParallel(cl)
+
+# Model tuning grids
+rfGrid <-  expand.grid(mtry = c(1, 7, 10, 15, 20, 25, 30, 35, 40, 45, 50))
+
+rrfGrid <- expand.grid(mtry = c(1, 7, 10, 15, 20, 25, 30, 35, 40, 45),
+                       coefReg = c(0.01,0.505,1),
+                       coefImp = c(0, 0.5, 1))
+
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           repeats = 1)
+```
+
+```{r RF,cache=TRUE, message=FALSE, warning=FALSE}
+# Random Forests
+start.time <- Sys.time()
+set.seed(1)
+rf <- train(x=train[,-1], y=train[,1], method="rf", ntree=1000,trControl=fitControl, tuneGrid=rfGrid, importance=TRUE)
+end.time <- Sys.time()
+time.taken.rf <- end.time - start.time
+```
+
+```{r ORFpls, cache=TRUE, include=FALSE}
+# Oblique random forests pls splits 
+start.time <- Sys.time()
+set.seed(2)
+orfpls <- train(Outcome~., data=train, method="ORFpls", ntree=1000, trControl=fitControl, tuneGrid=rfGrid, bImportance = TRUE)
+end.time <- Sys.time()
+time.taken.orfpls <- end.time - start.time
+```
+
+```{r rrf, cache=TRUE, message=FALSE, warning=FALSE}
+# Weighted Subspace Random Forests
+start.time <- Sys.time()
+set.seed(3)
+rrf <- train(Outcome~., data=train, method="RRF", ntree=1000, trControl=fitControl, tuneGrid=rrfGrid)
+end.time <- Sys.time()
+time.taken.rrf <- end.time - start.time
+```
+
+Model                 | Training time
+--------------------- | -------------
+Random Forest         | `r round(time.taken.rf,2)` secs
+Oblique RF pls        | `r round(time.taken.orfpls,2)` mins
+Regularized RF        | `r round(time.taken.rrf,2)` mins
+
+```{r SaveModels, cache=TRUE, message=FALSE, warning=FALSE}
+# Store trained models
+modelList <- list(rf=rf, orfpls=orfpls, rrf=rrf)
+
+# Stop cluster
+stopImplicitCluster()
+
+# Save trained models
+saveRDS(modelList, file = "modelList.rda")
+```
+
+```{r ROC, cache=TRUE, message=FALSE, warning=FALSE}
+# Load the models
+modelList <- readRDS("modelList.rda")
+
+# plot tuning parameters effects
+library(gridExtra)
+tuningPlotList <- list()
+oobPlotList <- list()
+predsList <- list()
+confuseMatList <- list()
+ROCcurveList <- list()
+accVec <- NULL
+OOBcount <- 1
+for(i in 1:length(modelList)){
+      tuningPlotList[[i]] <- ggplot(modelList[[i]]) + ggtitle(attributes(modelList)[[1]][i])
+      best <- modelList[[i]]$finalModel
+      predsList[[i]] <- predict(modelList[[i]], test)
+      probPreds <- predict(modelList[[i]], test, type="prob")[,2]
+      
+      # ROC curves
+      roc.curve <- function(s){
+            Y <- test$Outcome
+            Y <- as.numeric(Y)-1
+            Ps=(probPreds>s)*1
+            FP=sum((Ps==1)*(Y==0))/sum(Y==0)
+            TP=sum((Ps==1)*(Y==1))/sum(Y==1)
+            vect=c(FP,TP)
+            names(vect)=c("FPR","TPR")
+            return(vect)
+      }
+      ROC.curve <- Vectorize(roc.curve)
+      M.ROC <- ROC.curve(seq(0,1,by=0.01))
+      ROCcurveList[[i]] <- t(M.ROC) 
+      
+      confuseMatList[[i]] <- confusionMatrix(predsList[[i]], test$Outcome)
+      accVec[i] <- sum(as.numeric(predsList[[i]] == test$Outcome))/nrow(test)
+      if(length(best$err.rate[,1]) != 0){
+            oobPlotList[[OOBcount]] <- ggplot(data.frame(best$err.rate), aes(x=1:1000, y=OOB)) + geom_line(colour="red") +
+                  ggtitle("Out-of-bag Error vs Number of trees") + xlab("Number of trees") + ylab("OOB Error")
+            OOBcount <- OOBcount + 1
+            } 
+      
+      }
+```
+
+```{r TuningPlots, cache=TRUE, message=FALSE, warning=FALSE}
+grid.arrange(tuningPlotList[[1]], tuningPlotList[[2]], tuningPlotList[[3]], nrow=3, ncol=1)
+```
+
+```{r CompareModels1, cache=TRUE, message=FALSE, warning=FALSE}
+resamps <- resamples(list(rf=modelList$rf, orfpls=modelList$orfpls, rrf=modelList$rrf))
+
+bwplot(resamps, metric="Accuracy")
+```
+
+
+```{r ROCPlot, cache=TRUE, message=FALSE, warning=FALSE}
+rocp <- ggplot(data.frame(ROCcurveList[[1]]), aes(ROCcurveList[[1]][,1],ROCcurveList[[1]][,2], color="green")) + geom_line()
+rocp <- rocp + geom_line(data=data.frame(ROCcurveList[[2]]), aes(ROCcurveList[[2]][,1], ROCcurveList[[2]][,2], color="blue"))
+rocp <- rocp + geom_line(data=data.frame(ROCcurveList[[3]]), aes(ROCcurveList[[3]][,1], ROCcurveList[[3]][,2], color="yellow"))
+rocp <- rocp + geom_line(data=data.frame(x = c(0,1), y = c(0,1)), aes(x = x, y = y), colour = "black", linetype="dotted")
+rocp <- rocp + scale_colour_manual(name="Model", labels=c("rf", "orfpls", "rrf")
+                                   , values=c("green","blue", "yellow"))
+rocp + ggtitle("ROC curve") + xlab("False Positive Rate") + ylab("True Positive Rate")
+```
+
+Model                 | Test set accuracy
+-----------------     | -----------------
+Random Forest         | `r round((sum(as.numeric(predict(rf, test) == test$Outcome))/nrow(test))*100,2)`%
+Oblique RF pls        | `r round((sum(as.numeric(predict(orfpls, test) == test$Outcome))/nrow(test))*100,2)`%
+Regularized RF  | `r round((sum(as.numeric(predict(rrf, test) == test$Outcome))/nrow(test))*100,2)`% 
+
+
+```{r varImpPlot, cache=TRUE, message=FALSE, warning=FALSE}
+randomForest::varImpPlot(modelList$rf$finalModel, type=1)
+```
+
+## Automating the process using Domino 
+
+However, each match will have an effect on the team rankings and other descriptive statistics associated with the teams and therefore it important to include this new information when making a prediction for the next match.  
+
+![alt text](figures/main.png)
+
+```{r finalModel, eval=FALSE}
+### International Rugby game prediction model ###
+ 
+# load libraries
+library(caret)
+library(randomForest)
+ 
+# load data
+data <- read.csv("RWCData.csv")
+cols <- 4:ncol(data)
+data[,cols] = apply(data[,cols], 2, function(x) as.numeric(x))
+ 
+# tune Grid
+rfGrid <-  expand.grid(mtry = c(1, 7, 10, 15, 20, 25, 30, 35, 40, 45, 50))
+ 
+# Tune using 5-fold cross-validation
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           repeats = 1)
+ 
+# train classifier
+# Random Forests
+model <- train(x=data[,-1], y=data[,1], method="rf", ntree=1000,trControl=fitControl, tuneGrid=rfGrid)
+ 
+# save model
+saveRDS(model, file = "RWC_Prediction_Model.rda")
+```
+
+![alt text](figures/s1.png)
+
+![alt text](figures/s2.png)
+
+## Using Domino API Endpoints for prediction requests
+
+![alt text](figures/api.png)
+
+### References
+
+[1]: http://www.whatisrugby.com/rugby-basics/rubgy-overview/ "What is rugby"
+[2]: https://www.dominodatalab.com/ "Domino"
+[3]: https://www.r-project.org/ "R"
+[4]: http://www.rugbydata.com/ "Rugbydata"
+[5]: http://wrr.live555.com/ "rankings"
+[6]: https://en.wikipedia.org/wiki/World_Rugby_Rankings "wiki"
