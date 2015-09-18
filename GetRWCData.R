@@ -6,6 +6,8 @@ teams <- c("Namibia", "South Africa", "Argentina", "Canada", "United States",
            "Italy", "Romania", "Scotland", "Wales", "Australia",
            "Fiji", "New Zealand", "Samoa", "Tonga")
 
+saveRDS(teams, "teamNames.rda")
+
 # Get rank data
 library(XML)
 library(RCurl)
@@ -14,9 +16,16 @@ rank <- numeric(Nteams)
 rankScore <- numeric(Nteams)
 rankChange <- numeric(Nteams)
 
-urlRankScore <- "https://en.wikipedia.org/wiki/World_Rugby_Rankings"
+#urlRankScore <- "https://en.wikipedia.org/wiki/World_Rugby_Rankings"
+#tabs1 <- getURL(urlRankScore)
+#tabs1 <- readHTMLTable(tabs1, stringsAsFactors = F)
+
+urlRankScore <- "http://www.rugby15.co.za/irb-world-rankings/"
 tabs1 <- getURL(urlRankScore)
-tabs1 <- readHTMLTable(tabs1, stringsAsFactors = F)
+tabs1 <- readHTMLTable(tabs1)
+tabs1[[1]][,3] <- sapply(tabs1[[1]][,3], function(x) substr(x, 1, nchar(as.character(x))-4))
+tabs1[[1]][,3][tabs1[[1]][,3] == "USA"] <- "United States"
+tabs1[[1]][,4] <- as.numeric(as.character(tabs1[[1]][,4]))
 
 urlRank <- "http://wrr.live555.com/"
 tabs2 <- getURL(urlRank)
@@ -121,13 +130,34 @@ weights <- weights[!duplicated(interData)]
 library(lubridate)
 month <- month(interData$dates)
 year <- year(interData$dates)
-interData <- interData[,-4]
+#interData <- interData[,-4]
 interData$month <- month
 interData$year <- year
 
+
+dataIndex <- NULL 
+for(i in 1:length(teams)){
+    done <- 1
+    team <- teams[i]
+    count <- nrow(interData)
+    while(done < 21){
+        if(interData[count,2] == team || interData[count,3] == team){
+            if(!(count %in% dataIndex)){
+                dataIndex <- c(dataIndex, count)
+                done <- done + 1
+            }
+        }
+        count <- count-1
+    }
+}
+
+interData <- interData[dataIndex,]
+interData <- interData[order(interData$dates),]
+interData <- interData[,-4]
+
 # Only select matches as far back as the previous world cup
-weights <- weights[interData$year > 2012]
-interData <- interData[interData$year > 2012,]
+#weights <- weights[interData$year > 2010]
+#interData <- interData[interData$year > 2010,]
 
 
 # Add remaining variables
@@ -137,8 +167,8 @@ awayMat <- matrix(0, nrow=nrow(interData), ncol=24)
 for(i in 1:nrow(interData)){
     homeIndex <- which(teams == interData[i,2])
     awayIndex <- which(teams == interData[i,3])
-    homeMat[i,] <- weights[i]*c(otherVarList[[homeIndex]], rank[homeIndex], rankScore[homeIndex], rankChange[homeIndex])
-    awayMat[i,] <- weights[i]*c(otherVarList[[awayIndex]], rank[awayIndex], rankScore[awayIndex], rankChange[awayIndex])
+    homeMat[i,] <- c(otherVarList[[homeIndex]], rank[homeIndex], rankScore[homeIndex], rankChange[homeIndex])
+    awayMat[i,] <- c(otherVarList[[awayIndex]], rank[awayIndex], rankScore[awayIndex], rankChange[awayIndex])
 }
 
 # Export data as csv file
@@ -177,5 +207,9 @@ dataColNames <- c("Outcome", "HomeTeam", "AwayTeam",
               "RankAway", "RankScoreAway", "RankChangeAway")
 
 colnames(data) <- dataColNames
-write.table(data[1,], "newCase.csv", sep=",")
-write.table(data, "RWCData.csv", sep=",")
+data$month <- factor(data$month)
+data$year <- factor(data$year)
+
+# write data
+saveRDS(data[1,], "newCase.rda")
+saveRDS(data, "RWCData.rda")
